@@ -15,10 +15,11 @@ output, reversible.
 
 | file | what |
 |------|------|
+| **`patch_scope.py`** | **one command from your PC**: connect, root, provision frida-server, inject, hold |
 | **`PATCHING.md`** | the working patch: what's slow, where, and how to apply it |
 | **`FINDINGS.md`** | full bottleneck investigation (profiling, dead ends, corrections) |
-| `mho_speed_patch.js` | the Frida patch (bulk-copy `CApiWave::toWord`/`toByte`) |
-| `apply_patch.py` | attaches the patch to the running scope app |
+| `mho_speed_patch.js` | the Frida patch (bulk-copy `toWord`/`toByte` + `append` memcpy) |
+| `apply_patch.py` | lower-level: attach the patch to an already-provisioned scope |
 | `rigol_mho.py` | dependency-free SCPI helper (LAN socket + USB-TMC) + CLI |
 | `bench.py` | readout benchmark (size sweep, HTTP-ceiling, recv-timeline) |
 | `tools/loopbench.c` | **on-scope** loopback benchmark: measures pure on-device throughput with the network wire removed (proves the wire is not the limit) |
@@ -26,18 +27,32 @@ output, reversible.
 | `install_ssh_key.sh` | add your SSH key for root access (optional) |
 | `tools/` | investigation utilities: `probe.js`, `bench_append.cpp`, `loadgen.py` |
 
-## Quick start (the patch)
+## Quick start
 
-1. Get a root shell on the scope over ADB (it listens on TCP **55555**):
-   `adb connect <scope-ip>:55555`
-2. Put a matching `frida-server` (arm64) on the scope and run it as root.
-3. `pip install frida-tools` here, then:
-   ```
-   python3 apply_patch.py
-   ```
-   Leave it running; Ctrl-C detaches and restores the original code.
+You need only `adb` (Android platform-tools) and Python on your PC, plus the
+scope's IP. The scope exposes unauthenticated network ADB on port 55555 out of
+the box, so there's nothing to enable on it.
 
-See `PATCHING.md` for the details and the measured results.
+```
+pip install frida
+python3 patch_scope.py <scope-ip>
+```
+
+That's it. `patch_scope.py` connects over ADB, gets root, downloads and starts a
+matching `frida-server` on the scope (cached after the first run), injects the
+patch, and then **stays running** — leave the window open while you capture.
+Press **Ctrl-C** to revert the scope to stock behaviour.
+
+* Nothing is written to the scope's firmware; the patch is in-memory only and
+  also disappears on reboot.
+* For best results read each record in **one large `:WAV:DATA?` request**, not
+  many small chunks (~60 ms saved per avoided round-trip).
+* `apply_patch.py` is the lower-level path if you've already put `frida-server`
+  on the scope yourself. See `PATCHING.md` for details and measured results.
+
+> **Note:** the patch reverts the moment `patch_scope.py` disconnects (Frida
+> unloads its hooks). A fire-and-forget variant that survives disconnect is
+> planned — see PATCHING.md "Persistent variant".
 
 ## Status
 
