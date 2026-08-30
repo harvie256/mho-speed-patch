@@ -23,20 +23,23 @@ import rigol_mho
 
 
 # ---- capture (GUI-independent, testable) -----------------------------------
-def _timebase_for_depth(depth: int) -> float:
-    # MDEPth AUTO derives depth from window x sample-rate (<=1 GSa/s single ch):
-    # points = 10*(s/div)*srate  =>  s/div = depth/(10*1e9). Floor to keep a sane
-    # window. See tools/loopbench.c / project notes on the deep-memory quirk.
-    return max(depth * 1e-10, 1e-8)
-
-
 def capture(host: str, channel: int = 1, fmt: str = "WORD",
-            depth: int = 1_000_000, mode: str = "RAW",
-            acquire: bool = True, progress=None):
-    """Capture one trace. Returns (times, volts, stats).
+            mode: str = "RAW", stop: bool = True, max_points: int = 0,
+            progress=None):
+    """Read the waveform currently in the scope's memory. Returns (times, volts, stats).
 
-    stats: dict(points, nbytes, width, xfer_s, mbps, srate, acq_s).
-    Only the :WAV:DATA? transfer is timed (xfer_s); arming is separate (acq_s).
+    This does NOT change the scope's acquisition setup -- no timebase, memory
+    depth, sweep or trigger changes. It optionally :STOPs the scope (required to
+    read deep RAW memory) and reads whatever record is there. Set the scope up
+    yourself (timebase, depth, trigger) before capturing.
+
+    mode="RAW"    reads the full acquisition memory (:ACQuire:MDEPth? points).
+    mode="NORMal" reads the ~1000 on-screen points.
+    max_points>0  caps how many points are read (client-side only; the scope's
+                  settings are untouched).
+
+    stats: dict(points, nbytes, width, xfer_s, mbps, srate).
+    Only the :WAV:DATA? transfer is timed (xfer_s).
     """
     fmt = fmt.upper()
     mode = mode.upper()
@@ -47,22 +50,13 @@ def capture(host: str, channel: int = 1, fmt: str = "WORD",
             progress(msg)
 
     with rigol_mho.Scope(host=host, timeout=60.0) as scope:
-        acq_s = 0.0
-        if mode.startswith("RAW") and acquire:
-            note("arming acquisition...")
-            t = time.perf_counter()
-            scope.write(f":CHANnel{channel}:DISPlay ON")
-            scope.write(":TRIGger:SWEep AUTO")
-            scope.write(":STOP")
-            scope.write(f":TIMebase:MAIN:SCALe {_timebase_for_depth(depth):g}")
-            scope.write(":ACQuire:MDEPth AUTO")
-            scope.write(":RUN")
-            window = 10 * _timebase_for_depth(depth)
-            time.sleep(min(max(window + 0.8, 1.2), 6.0))
-            scope.write(":STOP")
+        if stop:
+            note("stopping acquisition...")
+            scope.stop()          # freeze the current record; RAW needs a stop
             scope.query("*OPC?")
-            acq_s = time.perf_counter() - t
 
+        # These are readout settings, not acquisition settings -- they select
+        # what/how we read, they don't change the captured waveform.
         scope.write(f":WAVeform:SOURce CHANnel{channel}")
         scope.write(f":WAVeform:MODE {mode}")
         scope.write(f":WAVeform:FORMat {fmt}")
@@ -72,25 +66,27 @@ def capture(host: str, channel: int = 1, fmt: str = "WORD",
             total = int(float(scope.query(":ACQuire:MDEPth?")))
         else:
             total = pre.points  # ~1000 on-screen points
+        if max_points and max_points > 0:
+            total = min(total, max_points)
 
-        # Read the whole record; one large request is fastest over LAN.
+        # Read the record; one large request is fastest over LAN.
         note(f"transferring {total:,} points...")
         buf = bytearray()
         start = 1
         chunk = max(total, 1)          # single request
         t0 = time.perf_counter()
         while start <= total:
-            stop = min(start + chunk - 1, total)
+            end = min(start + chunk - 1, total)
             scope.write(f":WAVeform:STARt {start}")
-            scope.write(f":WAVeform:STOP {stop}")
+            scope.write(f":WAVeform:STOP {end}")
             data = scope.query_block(":WAVeform:DATA?")
             if not data:
                 break
             buf += data
             got = len(data) // width
-            start += got
             if got == 0:
                 break
+            start += got
         xfer_s = time.perf_counter() - t0
 
     # decode + scale with numpy (fast, off the wire clock)
@@ -104,8 +100,7 @@ def capture(host: str, channel: int = 1, fmt: str = "WORD",
     nbytes = len(buf)
     stats = dict(points=raw.size, nbytes=nbytes, width=width,
                  xfer_s=xfer_s, mbps=(nbytes / xfer_s / 1e6 if xfer_s else 0.0),
-                 srate=(1.0 / pre.xincrement if pre.xincrement else 0.0),
-                 acq_s=acq_s)
+                 srate=(1.0 / pre.xincrement if pre.xincrement else 0.0))
     return times, volts, stats
 
 
@@ -135,8 +130,6 @@ def _fmt_stats(s):
             f"→ {s['mbps']:.2f} MB/s")
     if s.get("srate"):
         line += f"   (fs={s['srate']/1e6:.1f} MSa/s)"
-    if s.get("acq_s"):
-        line += f"   [+{s['acq_s']*1000:.0f} ms arming]"
     return line
 
 
@@ -148,11 +141,8 @@ def run_gui(default_host):
     from matplotlib.backends.backend_tkagg import (
         FigureCanvasTkAgg, NavigationToolbar2Tk)
 
-    DEPTHS = [("Screen (~1k)", 1000, "NORMal"),
-              ("10 k", 10_000, "RAW"),
-              ("100 k", 100_000, "RAW"),
-              ("1 M", 1_000_000, "RAW"),
-              ("10 M", 10_000_000, "RAW")]
+    READ_MODES = [("Full memory (RAW)", "RAW"),
+                  ("Screen (~1k)", "NORMal")]
 
     root = tk.Tk()
     root.title("Rigol raw-waveform grabber")
@@ -174,10 +164,14 @@ def run_gui(default_host):
     ttk.Combobox(bar, textvariable=fmt_var, values=["WORD", "BYTE"], width=6,
                  state="readonly").pack(side=tk.LEFT, padx=(2, 10))
 
-    ttk.Label(bar, text="Depth:").pack(side=tk.LEFT)
-    depth_var = tk.StringVar(value=DEPTHS[3][0])
-    ttk.Combobox(bar, textvariable=depth_var, values=[d[0] for d in DEPTHS],
-                 width=12, state="readonly").pack(side=tk.LEFT, padx=(2, 10))
+    ttk.Label(bar, text="Read:").pack(side=tk.LEFT)
+    mode_var = tk.StringVar(value=READ_MODES[0][0])
+    ttk.Combobox(bar, textvariable=mode_var, values=[m[0] for m in READ_MODES],
+                 width=17, state="readonly").pack(side=tk.LEFT, padx=(2, 10))
+
+    ttk.Label(bar, text="Max pts (0=all):").pack(side=tk.LEFT)
+    maxpts_var = tk.StringVar(value="0")
+    ttk.Entry(bar, textvariable=maxpts_var, width=10).pack(side=tk.LEFT, padx=(2, 10))
 
     capture_btn = ttk.Button(bar, text="Capture")
     capture_btn.pack(side=tk.LEFT, padx=(4, 0))
@@ -192,7 +186,8 @@ def run_gui(default_host):
     canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
     NavigationToolbar2Tk(canvas, root)
 
-    status = tk.StringVar(value="Ready. Tip: run patch_scope.py for ~5x faster reads.")
+    status = tk.StringVar(value="Ready. Set the scope up yourself; Capture just "
+                          "stops it and reads memory. Tip: patch_scope.py = ~5x faster.")
     ttk.Label(root, textvariable=status, anchor="w",
               relief=tk.SUNKEN, padding=4).pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -211,23 +206,27 @@ def run_gui(default_host):
         canvas.draw_idle()
         set_status(_fmt_stats(stats))
 
-    def worker(host, ch, fmt, depth, mode):
+    def worker(host, ch, fmt, mode, max_pts):
         try:
             times, volts, stats = capture(
-                host, ch, fmt, depth, mode,
+                host, ch, fmt, mode, stop=True, max_points=max_pts,
                 progress=lambda m: root.after(0, set_status, m))
             root.after(0, on_result, times, volts, stats, None)
         except Exception as e:
             root.after(0, on_result, None, None, None, str(e))
 
     def do_capture():
-        label = depth_var.get()
-        depth, mode = next((d, m) for (n, d, m) in DEPTHS if n == label)
+        label = mode_var.get()
+        mode = next(m for (n, m) in READ_MODES if n == label)
+        try:
+            max_pts = int(maxpts_var.get() or "0")
+        except ValueError:
+            max_pts = 0
         capture_btn.config(state=tk.DISABLED, text="Capturing…")
         set_status("connecting...")
         threading.Thread(target=worker, daemon=True,
                          args=(host_var.get().strip(), ch_var.get(),
-                               fmt_var.get(), depth, mode)).start()
+                               fmt_var.get(), mode, max_pts)).start()
 
     capture_btn.config(command=do_capture)
     root.mainloop()
@@ -242,13 +241,15 @@ def main(argv=None):
                     help="capture once and print stats, no GUI (for testing)")
     ap.add_argument("--channel", type=int, default=1)
     ap.add_argument("--format", default="WORD")
-    ap.add_argument("--depth", type=int, default=1_000_000)
+    ap.add_argument("--mode", default="RAW", help="RAW (full memory) or NORMal (screen)")
+    ap.add_argument("--max-points", type=int, default=0,
+                    help="cap points read (0 = all; client-side only)")
     args = ap.parse_args(argv)
 
     if args.headless:
-        mode = "NORMal" if args.depth <= 1200 else "RAW"
         _, _, stats = capture(args.host, args.channel, args.format,
-                              args.depth, mode, progress=print)
+                              args.mode, stop=True, max_points=args.max_points,
+                              progress=print)
         print(_fmt_stats(stats))
         return 0
     run_gui(args.host)

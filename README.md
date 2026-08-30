@@ -60,11 +60,14 @@ pip install numpy matplotlib
 python3 waveform_gui.py <scope-ip>
 ```
 
-Pick a channel, format (WORD/BYTE) and depth, hit **Capture**: it arms a fresh
-acquisition, reads the record, scales it with the preamble, and plots volts vs
-time. The status line shows points, size, **transfer time and MB/s** — run it
-before and after `patch_scope.py` to watch the speedup live. (`--headless`
-captures once and prints the stats, no window.)
+Set the scope up yourself (timebase, depth, trigger). Pick a channel, format
+(WORD/BYTE) and read mode (full memory / screen), hit **Capture**: it just
+**`:STOP`s the scope and reads what's in memory** — it does *not* change your
+timebase, memory depth, sweep or trigger. It scales the record with the preamble
+and plots volts vs time; the status line shows points, size, **transfer time and
+MB/s** — run it before and after `patch_scope.py` to watch the speedup live.
+("Max pts" caps the read client-side; `--headless` captures once and prints the
+stats, no window.)
 
 Over Wi-Fi you'll see the wire cap the patched rate (~2–3 MB/s); on a wired link
 the full on-device gain comes through.
