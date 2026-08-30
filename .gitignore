@@ -1,0 +1,32 @@
+# Proprietary Rigol firmware — DO NOT redistribute. Extract your own from your scope.
+libscope-auklet.so
+base.apk
+*.apk
+apkextract/
+
+# Large / downloaded tooling (fetch these yourself; see README)
+android-ndk-*/
+*-cross/
+frida-server
+frida-server.*
+platform-tools/
+*.zip
+*.tgz
+*.xz
+
+# Python / build junk
+__pycache__/
+*.pyc
+sshvenv/
+bench_arm*
+*.o
+
+# Scratch outputs
+*.out
+*.data
+*.csv
+*.png
+kallsyms.txt
+selfip*.txt
+ips*.txt
+dump.txt
