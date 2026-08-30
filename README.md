@@ -20,6 +20,7 @@ output, reversible.
 | **`FINDINGS.md`** | full bottleneck investigation (profiling, dead ends, corrections) |
 | `mho_speed_patch.js` | the Frida patch (bulk-copy `toWord`/`toByte` + `append` memcpy) |
 | `apply_patch.py` | lower-level: attach the patch to an already-provisioned scope |
+| `waveform_gui.py` | tiny Tk + matplotlib GUI: grab a raw waveform, plot it, show the transfer time / MB/s |
 | `rigol_mho.py` | dependency-free SCPI helper (LAN socket + USB-TMC) + CLI |
 | `bench.py` | readout benchmark (size sweep, HTTP-ceiling, recv-timeline) |
 | `tools/loopbench.c` | **on-scope** loopback benchmark: measures pure on-device throughput with the network wire removed (proves the wire is not the limit) |
@@ -53,6 +54,22 @@ Press **Ctrl-C** to revert the scope to stock behaviour.
 > **Note:** the patch reverts the moment `patch_scope.py` disconnects (Frida
 > unloads its hooks). A fire-and-forget variant that survives disconnect is
 > planned — see PATCHING.md "Persistent variant".
+
+## See it: capture + plot a waveform
+
+```
+pip install numpy matplotlib
+python3 waveform_gui.py <scope-ip>
+```
+
+Pick a channel, format (WORD/BYTE) and depth, hit **Capture**: it arms a fresh
+acquisition, reads the record, scales it with the preamble, and plots volts vs
+time. The status line shows points, size, **transfer time and MB/s** — run it
+before and after `patch_scope.py` to watch the speedup live. (`--headless`
+captures once and prints the stats, no window.)
+
+Over Wi-Fi you'll see the wire cap the patched rate (~2–3 MB/s); on a wired link
+the full on-device gain comes through.
 
 ## Status
 

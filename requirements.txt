@@ -1,1 +1,8 @@
+# patch_scope.py / apply_patch.py (applying the speedup):
 frida>=17
+
+# waveform_gui.py (capture + plot tool):
+numpy
+matplotlib
+
+# rigol_mho.py, bench.py: standard library only, nothing to install.
