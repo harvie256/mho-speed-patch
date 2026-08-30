@@ -7,7 +7,9 @@ Rockchip RK3399 / Android).
 The scope's `:WAVeform:DATA?` response is built one byte at a time into a
 `std::vector<char>`, which caps deep-memory readout at ~1.5–2 MB/s regardless of
 the transport. This repo documents how that was found and ships a runtime patch
-that replaces the byte-by-byte build with a bulk `memcpy`.
+that replaces the byte-by-byte build with a bulk `memcpy` — **~5× faster
+on-device** (measured wire-free on loopback: ~1.6 → ~8.5 MB/s), byte-identical
+output, reversible.
 
 ## Contents
 
@@ -19,6 +21,7 @@ that replaces the byte-by-byte build with a bulk `memcpy`.
 | `apply_patch.py` | attaches the patch to the running scope app |
 | `rigol_mho.py` | dependency-free SCPI helper (LAN socket + USB-TMC) + CLI |
 | `bench.py` | readout benchmark (size sweep, HTTP-ceiling, recv-timeline) |
+| `tools/loopbench.c` | **on-scope** loopback benchmark: measures pure on-device throughput with the network wire removed (proves the wire is not the limit) |
 | `install-udev-rule.sh` | udev rule for USB-TMC access |
 | `install_ssh_key.sh` | add your SSH key for root access (optional) |
 | `tools/` | investigation utilities: `probe.js`, `bench_append.cpp`, `loadgen.py` |
@@ -38,8 +41,14 @@ See `PATCHING.md` for the details and the measured results.
 
 ## Status
 
-Verified on MHO934 fw `00.01.00`: **byte-identical output, ~1.2–1.3× faster.**
-That's one of several per-byte stages fixed; see `PATCHING.md` for what remains.
+Verified on MHO934 fw `00.01.00`: **byte-identical output, stable under sustained
+load, ~5× faster on-device** (loopback, wire removed: ~1.6 → ~8.5 MB/s median;
+peaks >11 MB/s). Both per-byte stages (`toWord`/`toByte` and the framing `append`)
+are fixed. See `PATCHING.md` for the method and `FINDINGS.md` for how it was found.
+
+Over Wi-Fi you'll see less (~1.6×) because at ~8 MB/s the **scope now outruns the
+Wi-Fi link** — the bottleneck has moved to the wire, so a wired/Ethernet client
+is now worth it (it wasn't before the patch).
 
 ## Not included
 

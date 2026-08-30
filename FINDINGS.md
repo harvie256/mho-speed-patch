@@ -25,6 +25,47 @@ built before the efficient chunked send begins).
 A secondary waste: a second app thread busy-waits in `pselect6(0, NULL..., &tiny)`
 ~1.5 million times/sec during a read, burning a whole extra core for nothing.
 
+## Update — proven wire-free, root cause pinned to `append`, and a ~5× fix
+
+Later work removed the two remaining ambiguities and produced a much larger,
+verified speedup. See `PATCHING.md` for the patch itself.
+
+* **The wire is definitively not the limit.** A loopback benchmark run *on the
+  scope* (`tools/loopbench.c`, client → `127.0.0.1:5555`) gives the same ~1.5 MB/s
+  baseline as Wi-Fi. With the network reduced to a memory copy, throughput is
+  unchanged — so it's on-device, full stop. A future Ethernet link buys nothing
+  *until* the on-device rate is raised.
+
+* **There are two per-byte stages, both bottlenecked on the same primitive.**
+  `RByteArray::append(char const*, int)` copies **byte-by-byte via a per-element
+  construct loop, not `memcpy`** — confirmed by disassembly (a loop that
+  increments a counter and calls the vector construct per iteration). So:
+  (1) `CApiWave::toWord`/`toByte` call `append(&src[i], 1)` 2 M times, and
+  (2) the SCPI framing calls one bulk `append(data, ~2 MB)` that still loops 2 M
+  times *internally*. Fixing only (1) — the original patch — gave ~1.9×; (2) was
+  the hidden majority.
+
+* **Fixing both → ~5× on-device**, byte-identical, stable:
+
+  | (1 Mpt WORD, on-scope loopback, single request) | throughput |
+  |---|---|
+  | baseline | ~1.6 MB/s |
+  | stage 1 (`toWord`/`toByte`) | ~3.1 MB/s (~1.9×) |
+  | **stages 1+2 (`+append`)** | **~7–11.6 MB/s, median ~8.5 (~5×)** |
+
+* **The bottleneck has now moved to the wire.** At ~8 MB/s the scope outruns the
+  ~2–4 MB/s Wi-Fi link, so over Wi-Fi the same patch shows only ~1.6×. Ethernet
+  now matters. Chunk size is a second, free lever: reading in one large request
+  instead of many saves ~60 ms of command round-trips per extra chunk.
+
+* **Method notes / traps:** `Interceptor.replace` of the shared `append`
+  primitive crashes the app (it's called app-wide on many threads) — use `attach`
+  and gate on size (only the ~2 large framing calls/read). Per-thread CPU deltas
+  (`/proc/1199/task/*/stat`) showed the read is ~85% CPU-bound on the worker
+  thread; the live-waveform GUI (`RenderThread` + `task_plot_wave` + mali) burns
+  ~3 more cores continuously but turning the trace display off did not help
+  throughput.
+
 NOTE: an earlier revision of this file blamed a GPIO kernel driver
 (`hdcode_gpio`) for PIO readout. That was wrong -- it came from profiling the
 busy-wait thread, whose kernel PCs simpleperf mislabeled onto random modules
