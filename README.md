@@ -24,8 +24,6 @@ output, reversible.
 | `rigol_mho.py` | dependency-free SCPI helper (LAN socket + USB-TMC) + CLI |
 | `bench.py` | readout benchmark (size sweep, HTTP-ceiling, recv-timeline) |
 | `tools/loopbench.c` | **on-scope** loopback benchmark: measures pure on-device throughput with the network wire removed (proves the wire is not the limit) |
-| `install-udev-rule.sh` | udev rule for USB-TMC access |
-| `install_ssh_key.sh` | add your SSH key for root access (optional) |
 | `tools/` | investigation utilities: `probe.js`, `bench_append.cpp`, `loadgen.py` |
 
 ## Quick start
