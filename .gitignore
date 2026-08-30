@@ -17,9 +17,14 @@ platform-tools/
 # Python / build junk
 __pycache__/
 *.pyc
-sshvenv/
 bench_arm*
 *.o
+
+# Python virtual environments
+.venv/
+venv/
+env/
+sshvenv/
 
 # Scratch outputs
 *.out
