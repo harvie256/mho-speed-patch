@@ -216,6 +216,19 @@ def ensure_root(adb):
     die("could not get root on the scope (neither 'adb root' nor 'su' worked)")
 
 
+def current_pid(adb):
+    """Live pid of the app, or None. Unlike app_pid() this never exits: it runs
+    inside the watch loop, where a momentarily absent app is not fatal."""
+    try:
+        for how in (dict(root=True), dict(root=False)):
+            out = adb.shell(f"pidof {APP}", **how).stdout.strip().split()
+            if out and out[0].isdigit():
+                return int(out[0])
+    except Exception:
+        pass
+    return None
+
+
 def app_pid(adb):
     for how in (dict(root=True), dict(root=False)):
         pid = adb.shell(f"pidof {APP}", **how).stdout.strip().split()
@@ -377,16 +390,37 @@ def main():
                   lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
 
     print()
-    log("PATCH ACTIVE -- readout is now ~5x faster on-device.")
+    log("PATCH ACTIVE -- readout is now ~10x faster on-device.")
     if npinned:
-        log("TUNED -- 1 Mpt WORD ~6.9 MB/s, 10 Mpt ~10.8 MB/s sustained on a "
-            "100 Mbit link (~15% less for a one-shot capture).")
+        log("TUNED -- 20 MB single-request read: 2.8 MB/s stock -> ~28.5 MB/s "
+            "over USB gigabit Ethernet (~15% less for a one-shot capture).")
     log("Leave this window open while you capture. Press Ctrl-C to revert.")
     log("Tip: read in ONE large :WAV:DATA? request, not many chunks -- the "
         "fixed ~120 ms per request is what caps small reads, not throughput.")
     try:
         while True:
             time.sleep(RETUNE_EVERY)
+            # The app can restart under us (crash, low-memory kill, user action).
+            # The Frida script dies with it, but tuning below still succeeds
+            # against the new process -- so without this check we would keep
+            # reporting a healthy "re-tuned" line while the scope quietly ran
+            # STOCK, unpatched code. Re-inject instead.
+            live = current_pid(adb)
+            if live and live != pid:
+                log(f"app restarted ({pid} -> {live}); re-injecting the patch ...")
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+                try:
+                    session = inject(adb.serial, live, args.script)
+                    pid = live
+                    npinned = 0          # force a re-tune line for the new process
+                    log("re-injected -- patch active again")
+                except Exception as e:
+                    log(f"warning: re-injection failed ({e}); scope is running "
+                        f"STOCK until this is resolved")
+                    pid = live
             if stock:
                 # cheap and idempotent; re-applies if the app has restarted
                 n = apply_tuning(adb, TUNED_WMEM, TUNED_WMAX, BIG_CORES, WORKER_NICE)

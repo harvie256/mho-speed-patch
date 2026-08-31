@@ -37,6 +37,7 @@
 // The large-only attach approach below is what was verified safe.
 
 const APPEND_THRESH = 65536;   // only rewrite appends this size or larger
+const DTOR_THRESH   = 65536;   // only skip teardown for buffers this large
 
 const LIB = 'libscope-auklet.so';
 const mod = Process.getModuleByName(LIB);
@@ -117,6 +118,36 @@ if (!apAddr) {
     }
   });
   console.log('[mho-patch] append memcpy-grow active (large-only, thresh=' + APPEND_THRESH + ')');
+}
+
+// --- Stage 3: ~__vector_base<char>(), large buffers only ----------------------
+// Stages 1-2 fix how the response buffer is BUILT; nothing fixed how it is torn
+// down. libc++'s ~__vector_base calls clear() -> __destruct_at_end, which loops
+// calling allocator_traits::destroy<char> once per element. char is trivially
+// destructible, so every one of those calls is a no-op -- but there are two per
+// payload byte (measured: 200,421 calls for a 100,000-byte read, ~40M for a
+// 20 MB read), and they were ~20% of user cycles on the readout thread with
+// stages 1-2 already active.
+//
+// Setting __end_ = __begin_ on entry makes the inlined clear() find an empty
+// vector and skip the loop. The subsequent deallocate() uses __begin_ and
+// __end_cap_, which we leave untouched, so the buffer is still freed exactly
+// once. Large-only, to keep the blast radius off the app's small vectors.
+const vbAddr = resolve('_ZNSt6__ndk113__vector_baseIcNS_9allocatorIcEEED2Ev');
+if (!vbAddr) {
+  console.log('[mho-patch] vector_base dtor symbol not found; stage-3 skipped');
+} else {
+  Interceptor.attach(vbAddr, {
+    onEnter: function (args) {
+      const self = args[0];
+      const begin = self.readPointer();
+      if (begin.isNull()) return;                   // nothing allocated
+      const end = self.add(8).readPointer();
+      const n = end.sub(begin).toInt32();
+      if (n >= DTOR_THRESH) self.add(8).writePointer(begin);
+    }
+  });
+  console.log('[mho-patch] vector teardown O(1) (large-only, thresh=' + DTOR_THRESH + ')');
 }
 
 console.log('[mho-patch] ' + patched + ' converter(s) + append patched; readout built with memcpy.');
