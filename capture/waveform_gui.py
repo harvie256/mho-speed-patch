@@ -139,6 +139,17 @@ def capture(host: str, channels=None, fmt: str = "WORD",
                 scope.query("*OPC?")
                 first = int(float(scope.query(":WAVeform:STARt?")))
                 last = int(float(scope.query(":WAVeform:STOP?")))
+            # The mirror case: a range that *undershoots* the record. Nothing
+            # re-derives it (a :STOP mid-acquisition leaves one behind, and it
+            # then persists across captures), and unlike an overrun it is
+            # silent -- you just quietly read less than you acquired. We do not
+            # touch it, since a narrowed range may well be deliberate, but say
+            # so rather than let it pass unnoticed.
+            elif depth and (last - first + 1) < depth:
+                note(f"note: reading {last - first + 1:,} of the {depth:,}-point "
+                     f"record (range {first:,}-{last:,}). If that range is "
+                     f"stale rather than deliberate, re-derive it with "
+                     f":WAV:MODE NORMal then RAW.")
         expect = max(last - first + 1, 0)
 
         for i, ch in enumerate(want, 1):

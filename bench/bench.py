@@ -203,25 +203,58 @@ def setup_readout(t: Transport, depth: int, fmt: str, source=1,
       to fill deep memory is AUTO sweep + :RUN, let it fill (>= one window),
       then :STOP.
 
-    Also note :WAVeform:POINts? returns a fixed default read-count (10000),
-    NOT the memory depth -- so we drive reads from :ACQ:MDEPth?, returned here.
+    Returns the TRUE stored point count (:WAV:STOP? after the RAW re-derive),
+    which is what reads must be driven from. Neither :WAVeform:POINts? (a
+    stale echo of :WAV:STOP) nor :ACQ:MDEPth? (merely the setting) is reliable.
     The acquisition time is outside the measured readout.
     """
     t.write(":TRIGger:SWEep AUTO")
     t.write(":STOP")
     t.write(f":TIMebase:MAIN:SCALe {_timebase_for_depth(depth):g}")
     t.write(f":ACQuire:MDEPth {depth}")
-    t.write(":RUN")
-    # let at least one full window acquire, capped so we don't hang
     window = 10 * _timebase_for_depth(depth)
-    time.sleep(min(max(window + 0.5, 1.0), 4.0))
-    t.write(":STOP")
-    time.sleep(0.2)
+
+    # A :STOP issued mid-acquisition leaves a PARTIALLY filled record -- e.g.
+    # 8.94 of 10 Mpt -- and that short range then persists for every later
+    # reader, because nothing re-derives a range that *undershoots* the depth
+    # (waveform_gui only re-derives an overrun). So wait for a full window with
+    # headroom, verify the record actually filled, and retry with a longer wait
+    # rather than silently benchmarking a short record.
+    deadline = time.monotonic() + acq_timeout
+    stored = 0
+    for attempt in range(1, 5):
+        t.write(":RUN")
+        time.sleep(min(max(window * 1.5 + 0.5, 1.0), 10.0) * attempt)
+        t.write(":STOP")
+        time.sleep(0.2)
+        stored = _arm_raw(t, source, fmt)
+        if stored >= depth or time.monotonic() > deadline:
+            break
+    if stored < depth:
+        print(f"# warning: depth {depth:,} requested but only {stored:,} "
+              f"points stored; benchmarking the short record", file=sys.stderr)
+    return stored
+
+
+def _arm_raw(t: Transport, source: int, fmt: str) -> int:
+    """Arm RAW readout and return the true stored point count."""
     t.write(f":WAVeform:SOURce CHANnel{source}")
+    # Only the NORMal -> RAW *transition* re-derives :WAV:STARt/:STOP to the
+    # full record. Writing RAW while already in RAW is a no-op, so a previous
+    # run's stale (often out-of-range) window persists and every subsequent
+    # :WAV:STARt/:STOP write is rejected with -200,"Command execute failed".
+    t.write(":WAVeform:MODE NORMal")
     t.write(":WAVeform:MODE RAW")
     t.write(f":WAVeform:FORMat {fmt}")
     t.query("*OPC?")
-    return int(float(t.query(":ACQuire:MDEPth?")))
+    # :ACQ:MDEPth is the *setting*; the record actually stored is usually
+    # smaller (the acquisition window may not fill it -- e.g. 9.57 Mpt for a
+    # 10 Mpt setting). The NORMal -> RAW transition above re-derives
+    # :WAV:STOP to the true stored count, so that is what we must read to.
+    # Reading past the end does NOT error and does NOT return 0 bytes: the
+    # scope hands back exactly one point per request, which walks the caller
+    # forward 2 bytes at a time for hours.
+    return int(float(t.query(":WAVeform:STOP?")))
 
 
 def read_all(t: Transport, points: int, width: int, chunk_points: int):
@@ -231,14 +264,19 @@ def read_all(t: Transport, points: int, width: int, chunk_points: int):
     t0 = time.perf_counter()
     while start <= points:
         stop = min(start + chunk_points - 1, points)
+        want = stop - start + 1
         t.write(f":WAVeform:STARt {start}")
         t.write(f":WAVeform:STOP {stop}")
         data = t.read_block(":WAVeform:DATA?")
         got += len(data)
         n = len(data) // width
-        if n == 0:
-            break
         start += n
+        # A short read means we hit the end of the stored record. Past the end
+        # the scope returns one point per request rather than an error or an
+        # empty block, so a bare `n == 0` guard never fires and the loop would
+        # crawl forward 2 bytes at a time.
+        if n < want:
+            break
     dt = time.perf_counter() - t0
     return got, dt
 
