@@ -28,10 +28,10 @@ A secondary waste: a second app thread busy-waits in `pselect6(0, NULL..., &tiny
 ## Update — proven wire-free, root cause pinned to `append`, and a ~5× fix
 
 Later work removed the two remaining ambiguities and produced a much larger,
-verified speedup. See `PATCHING.md` for the patch itself.
+verified speedup. See `docs/PATCHING.md` for the patch itself.
 
 * **The wire is definitively not the limit.** A loopback benchmark run *on the
-  scope* (`tools/loopbench.c`, client → `127.0.0.1:5555`) gives the same ~1.5 MB/s
+  scope* (`bench/loopbench.c`, client → `127.0.0.1:5555`) gives the same ~1.5 MB/s
   baseline as Wi-Fi. With the network reduced to a memory copy, throughput is
   unchanged — so it's on-device, full stop. A future Ethernet link buys nothing
   *until* the on-device rate is raised.
@@ -186,16 +186,16 @@ what pinned the real send path and the busy-wait's `n=0` pselect.
 
 ## Reproduce
 
-    python3 bench.py --http                        # transport ceiling
-    python3 bench.py --timeline --depth 1000000    # prep-vs-stream breakdown
-    python3 bench.py --transport lan --depths 100000,1000000 --format WORD
-    python3 bench.py --transport lan --depth 1000000 --format BYTE
+    python3 bench/bench.py --http                        # transport ceiling
+    python3 bench/bench.py --timeline --depth 1000000    # prep-vs-stream breakdown
+    python3 bench/bench.py --transport lan --depths 100000,1000000 --format WORD
+    python3 bench/bench.py --transport lan --depth 1000000 --format BYTE
 
 ## Fix validation (what actually helps)
 
 You can't source-patch the compiled proprietary `libscope-auklet.so` (and the
 per-element path spans multiple call sites, so there's no single site to
-binary-patch), so this models the fix instead. `bench_append.cpp` builds a 2 MB
+binary-patch), so this models the fix instead. `bench/bench_append.cpp` builds a 2 MB
 buffer three ways, compiled with the **NDK's libc++ (the same STL the scope
 uses) and run ON the scope's RK3399**:
 
@@ -230,5 +230,108 @@ Toolchain for reuse: Android NDK r27c at `/home/derryn/opt/android-ndk-r27c`.
 Build+run:
     NDK=/home/derryn/opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin
     $NDK/aarch64-linux-android30-clang++ -O0 -std=c++17 -static-libstdc++ \
-        bench_append.cpp -o bench_arm && adb push bench_arm /data/local/tmp/ && \
+        bench/bench_append.cpp -o bench_arm && adb push bench_arm /data/local/tmp/ && \
         adb shell /data/local/tmp/bench_arm
+
+## Update 2 — over Ethernet: where the *remaining* gap went
+
+With the patch applied and the scope on a wired **100 Mbit** link (`eth0`,
+full duplex, no errors), readout measured **~5.3 MB/s** against an on-device
+loopback figure of ~8.5-11 MB/s. The missing ~4 MB/s was not the wire.
+
+**The wire is blameless.** `dd if=/dev/zero | nc` from the scope to the PC over
+the same link gives **11.75 MB/s** (94.0 Mbit/s) — line rate for 100 Mbit after
+framing. Instrumenting every `recv()` of a real `:WAV:DATA?` shows the SCPI
+stream hits **11.8 MB/s while it is actually moving** — identical to the raw
+ceiling. There is nothing to win on the wire; it was simply **idle 55-65% of the
+read**.
+
+**The scope never marshals and sends at the same time.** Stalls in the recv
+timeline land exactly on **1 MiB boundaries** (999 KiB, 1999 KiB, 2999 KiB...),
+matching the ~1 MiB `write()` chunks seen earlier under ftrace. The app runs a
+strict `build 1 MiB -> write 1 MiB -> build 1 MiB -> ...` loop, so device time
+and wire time **add** instead of overlapping:
+
+    1 / (1/8.4 MB/s device + 1/11.8 MB/s wire) = 4.9 MB/s   ~= what we measured
+
+Two host-side causes, both fixable at runtime with no firmware change
+(now folded into `patch/patch_scope.py`):
+
+1. **`tcp_wmem` max is 110208 bytes** while the app writes 1 MiB at a time. Every
+   `write()` blocks in `tcp_sendmsg` until the wire drains it, so the CPU cannot
+   start the next chunk. Raising the send buffer to 4 MB lets `write()` return
+   immediately and the next chunk builds while the kernel drains the previous
+   one. (8 MB read: 6.7 -> 8.7 MB/s.)
+
+2. **The readout thread runs on the little cores.** Sampling `/proc/<pid>/task/*/stat`
+   during a read shows the worker (`Thread-12` here; the name varies per session)
+   migrating across cpu1/2/3/5 — mostly the **1.416 GHz A53s** — while
+   `task_plot_wave` owns cpu4 and `RenderThread` owns cpu5, the two **1.8 GHz
+   A72s**. The GUI burns ~1.6 cores continuously and wins both big cores; the
+   readout gets ~63% of a little one, plus a cache-cold migration per chunk.
+   `taskset`-ing the worker to `cpu4-5` roughly halves marshalling time and drops
+   TTFB from ~230 ms to ~120 ms. Both governors already sit at max frequency and
+   the SoC is at 52 C, so it is placement, not clocks or thermals.
+
+   Pinning the *GUI* threads down to the A53s as well buys nothing further, so
+   leave them alone and keep the UI responsive.
+
+Measured on the MHO934, 100 Mbit wired, patch active, median of 7 reads on a
+warmed connection (see the cold-connection note below):
+
+| config | 2 MB (1 Mpt WORD) | 20 MB (10 Mpt WORD) | wire idle @20 MB |
+|---|---:|---:|---:|
+| stock kernel + scheduler | 5.3-6.0 MB/s | ~7 MB/s | ~45% |
+| + 4 MB `tcp_wmem` | 6.2 MB/s | 8.7 MB/s | 26% |
+| **+ worker pinned to A72** | **6.9 MB/s** | **10.8 MB/s** | **8%** |
+| raw TCP ceiling on this link | 11.75 MB/s | 11.75 MB/s | — |
+
+**After tuning the readout is wire-bound.** The whole read collapses to a simple,
+predictive model:
+
+    read time  ~=  120 ms  +  bytes / 11.8 MB/s
+
+That ~120 ms is why *rate* looks bad on small reads and has nothing to do with
+throughput. It breaks down as ~26 ms of SCPI command latency (a bare `*OPC?`
+round trip costs **24.5 ms** on a 1 ms-RTT link — the SCPI parser services
+commands on a slow tick, not on arrival) plus ~90 ms building the first 1 MiB,
+which by definition cannot overlap with a wire that has nothing on it yet. TTFB
+is flat at ~117 ms from 1 Mpt all the way to 10 Mpt, confirming it saturates once
+the first chunk is full.
+
+Consequences:
+
+* **Ask for everything in one request.** 20 MB in a single `:WAV:DATA?` runs at
+  **10.8 MB/s — 92% of line rate**. The same bytes as 2 MB requests run at 6.9.
+* **You never have to name a point count -- but the range goes stale.** Entering
+  RAW mode makes the scope set `:WAV:STARt`/`:STOP` to the full memory depth
+  itself, which is why you normally never type a number. The catch is that only
+  the **NORMal -> RAW transition** re-derives them: writing `:WAV:MODE RAW` while
+  already in RAW is a no-op. And `:WAV:STOP` does not follow `:ACQ:MDEPth`, so a
+  range left from a deeper setup just persists. The scope then **pads rather than
+  clamps**: 1 Mpt in memory with `:WAV:STOP 10000000` returns a full 20 MB block,
+  18 MB of it garbage, in 8.5 s, with no error. `:WAV:POINts?` and the preamble
+  both echo the stale STOP, so neither catches it; `MAX`/`MAXimum`/`DEFault` are
+  rejected (-200 / -120). `capture/waveform_gui.py` checks `:WAV:STOP?` against
+  `:ACQ:MDEPth?` and, if the range overruns the record, bounces the mode to let
+  the scope re-derive it -- while leaving a deliberate sub-range alone.
+
+* **Never put `:WAVeform:STARt`/`:STOP` inside a timed region.** Each costs
+  ~39 ms of device service time; the pair adds ~43 ms. `capture/waveform_gui.py` used to
+  send them inside its transfer timer, which made it report ~5.8 MB/s where the
+  raw benchmark reported ~6.9 for the identical transfer. It no longer sends them
+  at all -- the readout range is now the operator's to set, and one bare
+  `:WAV:DATA?` is the only thing inside the clock.
+
+* **A cold connection reads ~15% slower than a warm one.** Successive 20 MB reads
+  on one socket climb 8.9 -> 9.3 -> 9.6 -> 10.1 -> ~10.8 MB/s and stay there, so
+  a one-shot capture on a fresh connection gets ~8.9-9.2 while the sustained
+  figure is ~10.8. It is not TCP: forcing the scope's send buffer to start
+  pre-grown (`tcp_wmem` default = max) changes nothing, and slow-start over
+  13,700 segments would be over in milliseconds. The likeliest cause is the app
+  faulting in a fresh ~20 MB response buffer each time until the allocator starts
+  retaining it. Quote the warm number for throughput and the cold one for
+  single-shot capture latency -- they measure different things.
+* **Gigabit would not help much** and this scope only has a 100 Mbit PHY anyway:
+  the device marshals at ~8-9 MB/s once pinned, so ~11.8 MB/s of wire is already
+  slightly more than it can feed.

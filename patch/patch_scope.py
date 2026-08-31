@@ -5,25 +5,42 @@ Run this on your PC before doing captures. It:
   1. connects to the scope over network ADB (port 55555),
   2. gets root (`adb root`, falling back to `su`),
   3. downloads + pushes + starts a matching frida-server (cached, version-locked),
-  4. injects mho_speed_patch.js into com.rigol.scope, and
-  5. STAYS RUNNING -- leave this window open while you capture.
+  4. injects mho_speed_patch.js into com.rigol.scope,
+  5. tunes the scope for a wired link (see below; --no-tune to skip), and
+  6. STAYS RUNNING -- leave this window open while you capture.
 
-Nothing is written to the scope's firmware. The patch lives only while this tool
-is attached: press Ctrl-C (or reboot the scope) to revert to stock behaviour.
+The patch makes the scope *marshal* fast; the tuning makes it actually *overlap*
+marshalling with the send, so the wire stops idling. Two knobs, both measured:
+
+  * TCP send buffer 110 KB -> 4 MB. The app write()s the response in 1 MiB
+    chunks; with the stock 110 KB buffer every write blocks until the wire
+    drains it, so the CPU cannot start building the next chunk.
+  * Pin the SCPI readout threads to the A72 big cores (cpu4-5). By default the
+    scheduler leaves them migrating over the 1.4 GHz A53s while the GUI owns
+    both 1.8 GHz A72s. GUI threads are left alone, so the UI stays responsive.
+
+Together these take a 1 Mpt WORD read from ~5.3 to ~6.9 MB/s, and a 10 Mpt read
+to ~10.8 MB/s on a sustained connection -- 92% of 100 Mbit line rate. A one-shot
+capture on a fresh connection lands ~15% lower. See FINDINGS.md "Update 2".
+
+Nothing is written to the scope's firmware. Both the patch and the tuning live
+only while this tool is attached: press Ctrl-C (or `kill` it, or reboot the
+scope) to revert to stock behaviour.
 
 Prerequisites on the PC:
   * `adb` on PATH (or pass --adb / drop platform-tools next to this script)
   * `pip install frida`     (the Python binding; frida-tools not required)
 
-Usage:
-  python3 patch_scope.py 172.30.188.217
-  python3 patch_scope.py 172.30.188.217 --frida-server ./frida-server   # offline
+Usage (from the repo root):
+  python3 patch/patch_scope.py 172.30.188.217
+  python3 patch/patch_scope.py 172.30.188.217 --frida-server ./frida-server
 """
 import argparse
 import hashlib
 import lzma
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -34,7 +51,17 @@ APP = "com.rigol.scope"
 ADB_PORT = 55555
 SCPI_PORT = 5555
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # repo root; patch/ lives one level down
 DEV_FS = "/data/local/tmp/frida-server"
+# Wired-link tuning (see FINDINGS.md "Update 2"). All in-memory, all reverted
+# on exit; the scope also clears them on reboot.
+TUNED_WMEM = "4096 2097152 4194304"   # tcp_wmem: 110 KB max -> 4 MB
+TUNED_WMAX = "4194304"                # net.core.wmem_max
+BIG_CORES = "30"                      # cpu4-5 mask: the RK3399's two A72s
+ALL_CORES = "3f"                      # cpu0-5: stock, unrestricted
+WORKER_NICE = "-20"                   # readout threads; app default is -10
+STOCK_NICE = "-10"
+RETUNE_EVERY = 30.0                   # seconds; self-heals if the app restarts
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "mho-speed-patch")
 
 
@@ -51,9 +78,10 @@ def die(msg, code=1):
 def find_adb(explicit):
     if explicit:
         return explicit
-    local = os.path.join(HERE, "platform-tools", "adb")
-    if os.path.exists(local):
-        return local
+    for base in (ROOT, HERE):
+        local = os.path.join(base, "platform-tools", "adb")
+        if os.path.exists(local):
+            return local
     found = shutil.which("adb")
     if found:
         return found
@@ -66,17 +94,32 @@ class Adb:
         self.adb = adb
         self.serial = serial
 
-    def _run(self, args, **kw):
-        return subprocess.run([self.adb, "-s", self.serial, *args],
-                              capture_output=True, text=True, **kw)
+    def _run(self, args, timeout=60, **kw):
+        # capture_output waits for EOF on the pipes, not for the command to
+        # exit -- anything left holding the device-side stdout/stderr (a
+        # daemon, say) would block us forever. The timeout is the backstop;
+        # commands that spawn daemons must also redirect their stdio (see
+        # ensure_frida_server).
+        try:
+            return subprocess.run([self.adb, "-s", self.serial, *args],
+                                  capture_output=True, text=True,
+                                  timeout=timeout, **kw)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                args, 124, stdout="", stderr=f"adb timed out after {timeout}s")
 
-    def raw(self, args, **kw):
-        return subprocess.run([self.adb, *args], capture_output=True, text=True, **kw)
+    def raw(self, args, timeout=60, **kw):
+        try:
+            return subprocess.run([self.adb, *args], capture_output=True,
+                                  text=True, timeout=timeout, **kw)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                args, 124, stdout="", stderr=f"adb timed out after {timeout}s")
 
-    def shell(self, cmd, root=False):
+    def shell(self, cmd, root=False, timeout=60):
         if root:
             cmd = f"su -c '{cmd}'"
-        return self._run(["shell", cmd])
+        return self._run(["shell", cmd], timeout=timeout)
 
     def push(self, local, remote):
         return self._run(["push", local, remote])
@@ -136,8 +179,11 @@ def ensure_frida_server(adb, version, local_path):
         if r.returncode != 0:
             die(f"push failed: {r.stderr.strip()}")
     adb.shell(f"chmod 755 {DEV_FS}", root=True)
-    # -D daemonizes: survives the adb shell exiting.
-    adb.shell(f"{DEV_FS} -D", root=True)
+    # -D daemonizes so it survives the adb shell exiting. The stdio redirect is
+    # what stops us hanging: the daemon inherits adb's stdout/stderr pipes, and
+    # capture_output waits for those to reach EOF, so without </dev/null and
+    # >/dev/null the launch call blocks forever even though the server started.
+    adb.shell(f"{DEV_FS} -D </dev/null >/dev/null 2>&1", root=True, timeout=20)
     for _ in range(20):
         time.sleep(0.3)
         if adb.shell("pidof frida-server", root=True).stdout.strip():
@@ -176,6 +222,73 @@ def app_pid(adb):
         if pid and pid[0].isdigit():
             return int(pid[0])
     die(f"{APP} is not running on the scope")
+
+
+# --- wired-link tuning -------------------------------------------------------
+# Note: every shell snippet below avoids single quotes -- Adb.shell(root=True)
+# wraps the command in su -c '...'.
+
+def read_stock_tuning(adb):
+    """Snapshot what we are about to change, so revert puts back exactly that."""
+    wmem = adb.shell("cat /proc/sys/net/ipv4/tcp_wmem").stdout.strip()
+    wmax = adb.shell("cat /proc/sys/net/core/wmem_max").stdout.strip()
+    # tabs -> spaces; the sysctl accepts either but we echo it back verbatim
+    wmem = " ".join(wmem.split())
+    if not wmem or not wmax.isdigit():
+        return None
+    return wmem, wmax
+
+
+def apply_tuning(adb, wmem, wmax, mask, nice):
+    """Set the send-buffer sysctls and pin the SCPI readout threads.
+
+    Returns the number of threads pinned, or -1 if the app was not found.
+    The readout threads are a fixed pool created at app start (they are named
+    Thread-N and are not spawned per connection), so one pass is enough -- but
+    main() re-runs this periodically so it self-heals if the app restarts.
+    """
+    snippet = (
+        f'P=$(pidof {APP}); '
+        f'if [ -z "$P" ]; then echo -1; exit 0; fi; '
+        f'echo "{wmem}" > /proc/sys/net/ipv4/tcp_wmem; '
+        f'echo {wmax} > /proc/sys/net/core/wmem_max; '
+        f'n=0; '
+        f'for t in /proc/$P/task/*/; do '
+        f'  case $(cat $t/comm 2>/dev/null) in '
+        f'    Thread-*) tid=$(basename $t); '
+        f'              taskset -p {mask} $tid >/dev/null 2>&1 && n=$((n+1)); '
+        f'              renice -n {nice} -p $tid >/dev/null 2>&1 ;; '
+        f'  esac; '
+        f'done; '
+        f'echo $n'
+    )
+    out = adb.shell(snippet).stdout.strip().split()
+    if not out or not out[-1].lstrip("-").isdigit():
+        out = adb.shell(snippet, root=True).stdout.strip().split()
+    return int(out[-1]) if out and out[-1].lstrip("-").isdigit() else -1
+
+
+def tune(adb):
+    """Apply the wired-link tuning. Returns (stock, npinned) for revert."""
+    stock = read_stock_tuning(adb)
+    if stock is None:
+        log("warning: could not read the scope's TCP settings; skipping tuning")
+        return None, 0
+    n = apply_tuning(adb, TUNED_WMEM, TUNED_WMAX, BIG_CORES, WORKER_NICE)
+    if n < 0:
+        log("warning: app not running; tuning not applied")
+        return stock, 0
+    log(f"tuned for wired readout: tcp_wmem -> 4 MB, {n} readout thread(s) "
+        f"pinned to cpu4-5 (A72)")
+    return stock, n
+
+
+def untune(adb, stock):
+    """Put the send buffers and thread placement back the way we found them."""
+    if not stock:
+        return
+    wmem, wmax = stock
+    apply_tuning(adb, wmem, wmax, ALL_CORES, STOCK_NICE)
 
 
 # --- inject ------------------------------------------------------------------
@@ -233,6 +346,8 @@ def main():
     ap.add_argument("--frida-server", help="local frida-server-arm64 to push (skip download)")
     ap.add_argument("--script", default=os.path.join(HERE, "mho_speed_patch.js"))
     ap.add_argument("--no-verify", action="store_true", help="skip the SCPI smoke-test")
+    ap.add_argument("--no-tune", action="store_true",
+                    help="skip the wired-link tuning (send buffer + core pinning)")
     args = ap.parse_args()
 
     if not os.path.exists(args.script):
@@ -249,16 +364,35 @@ def main():
     log(f"injecting into {APP} (pid {pid}) ...")
     session = inject(adb.serial, pid, args.script)
 
+    stock, npinned = (None, 0)
+    if not args.no_tune:
+        stock, npinned = tune(adb)
+
     if not args.no_verify:
         smoke_test(args.ip)
 
+    # Ctrl-C already unwinds to the finally below; make a plain `kill` (and
+    # `timeout`) do the same, so the scope is never left tuned and patched.
+    signal.signal(signal.SIGTERM,
+                  lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+
     print()
     log("PATCH ACTIVE -- readout is now ~5x faster on-device.")
+    if npinned:
+        log("TUNED -- 1 Mpt WORD ~6.9 MB/s, 10 Mpt ~10.8 MB/s sustained on a "
+            "100 Mbit link (~15% less for a one-shot capture).")
     log("Leave this window open while you capture. Press Ctrl-C to revert.")
-    log("Tip: read in ONE large :WAV:DATA? request, not many chunks.")
+    log("Tip: read in ONE large :WAV:DATA? request, not many chunks -- the "
+        "fixed ~120 ms per request is what caps small reads, not throughput.")
     try:
         while True:
-            time.sleep(1)
+            time.sleep(RETUNE_EVERY)
+            if stock:
+                # cheap and idempotent; re-applies if the app has restarted
+                n = apply_tuning(adb, TUNED_WMEM, TUNED_WMAX, BIG_CORES, WORKER_NICE)
+                if n > 0 and n != npinned:
+                    log(f"re-tuned: {n} readout thread(s) pinned")
+                    npinned = n
     except KeyboardInterrupt:
         pass
     finally:
@@ -266,8 +400,11 @@ def main():
             session.detach()
         except Exception:
             pass
+        if stock:
+            untune(adb, stock)
         print()
-        log("detached -- stock (slow) behaviour restored. frida-server left running.")
+        log("detached -- stock (slow) behaviour and scope tuning restored. "
+            "frida-server left running.")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ applies to the MHO900 / DHO800 / DHO900 family (shared `libscope-auklet.so`).
 The SCPI waveform response (`:WAVeform:DATA?`) is assembled **one byte at a
 time** into a `std::vector<char>`, because the underlying primitive
 `RByteArray::append(char const*, int)` copies byte-by-byte via a per-element
-construct loop (it is **not** a `memcpy`). See `FINDINGS.md` for the full
+construct loop (it is **not** a `memcpy`). See `docs/FINDINGS.md` for the full
 investigation.
 
 ## Two stages, one root cause
@@ -27,12 +27,12 @@ majority. Fixing both gets ~5× (see results below). The key realisation:
 
 ## Measuring on-device (wire removed)
 
-`tools/loopbench.c` is a tiny SCPI client that runs **on the scope** and connects
+`bench/loopbench.c` is a tiny SCPI client that runs **on the scope** and connects
 to `127.0.0.1:5555`, so the network is loopback (a memory copy) and what you
 measure is the pure on-device production rate. Cross-compile with the NDK and push:
 
 ```
-$NDK/.../aarch64-linux-android30-clang -O2 -o loopbench tools/loopbench.c
+$NDK/.../aarch64-linux-android30-clang -O2 -o loopbench bench/loopbench.c
 adb push loopbench /data/local/tmp/ && adb shell "su -c 'chmod 755 /data/local/tmp/loopbench'"
 adb shell "su -c '/data/local/tmp/loopbench 1000000 WORD 1000000 6'"   # depth fmt chunk reps
 ```
@@ -54,7 +54,7 @@ return ret;                           // no transformation — a plain copy
 ```
 
 Call counts during **one** 1 Mpt WORD read (measured with a Frida probe,
-`tools/probe.js`):
+`bench/probe.js`):
 
 | function | calls per read |
 |----------|---------------:|
@@ -117,7 +117,7 @@ and per-byte `append` is gone; remaining time is real bulk work + transport.
 Prereqs:
 1. Root shell on the scope over ADB — `adb connect <ip>:55555` (the Android
    debug bridge is on TCP **55555**; SSH is pubkey-only with Rigol's own keys).
-   See `FINDINGS.md`.
+   See `docs/FINDINGS.md`.
 2. `frida-server` (arm64, matching your `frida-tools` version) on the scope:
    ```
    adb shell "su -c '/data/local/tmp/frida-server -D &'"
@@ -128,7 +128,7 @@ Apply (stays active while running; Ctrl-C restores the original):
 ```
 python3 apply_patch.py            # attach to com.rigol.scope over adb
 ```
-Then read waveforms as usual (`rigol_mho.py`, `bench.py`, or your own SCPI).
+Then read waveforms as usual (`capture/rigol_mho.py`, `bench/bench.py`, or your own SCPI).
 
 ## Adapting to another firmware / offsets
 

@@ -11,20 +11,24 @@ Prereqs (see README):
   * `pip install frida-tools` on this machine
   * device reachable over adb (`adb connect <ip>:55555`)
 
-Usage:
-  python3 apply_patch.py                # attach by process name over USB/adb
-  python3 apply_patch.py --pid 1199
-  python3 apply_patch.py --host 172.30.188.217   # network frida (frida-server -l 0.0.0.0)
+Usage (from anywhere; the patch script is found beside this file):
+  python3 patch/apply_patch.py                # attach by name over USB/adb
+  python3 patch/apply_patch.py --pid 1199
+  python3 patch/apply_patch.py --host 172.30.188.217   # network frida
 """
-import argparse, sys, time
+import argparse, os, sys, time
 import frida
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pid", type=int, help="target pid (default: find com.rigol.scope)")
     ap.add_argument("--name", default="com.rigol.scope", help="target process name")
     ap.add_argument("--host", help="frida-server host:port for network attach")
-    ap.add_argument("--script", default="mho_speed_patch.js")
+    ap.add_argument("--script",
+                    default=os.path.join(HERE, "mho_speed_patch.js"),
+                    help="patch script (default: the one beside this file)")
     args = ap.parse_args()
 
     dev = frida.get_device_manager().add_remote_device(args.host) if args.host \

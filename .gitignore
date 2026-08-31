@@ -31,6 +31,8 @@ sshvenv/
 *.data
 *.csv
 *.png
+# ...but the README's GUI screenshots are part of the repo
+!screenshots/*.png
 kallsyms.txt
 selfip*.txt
 ips*.txt
