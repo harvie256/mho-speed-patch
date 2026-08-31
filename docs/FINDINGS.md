@@ -226,12 +226,16 @@ bounded by the next limit (efficient ~1 MB socket writes near the ~4.4 MB/s wire
 burst, plus the pselect6 busy-wait) -- so expect a ~2-3x overall readout speedup,
 with the build no longer the wall. Only Rigol can ship this in firmware.
 
-Toolchain for reuse: Android NDK r27c at `/home/derryn/opt/android-ndk-r27c`.
-Build+run:
-    NDK=/home/derryn/opt/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin
+Toolchain for reuse: Android NDK r27c (any recent r2x works). Point
+`ANDROID_NDK` at your unpacked NDK, then build+run:
+
+    export ANDROID_NDK=/path/to/android-ndk-r27c
+    NDK=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
     $NDK/aarch64-linux-android30-clang++ -O0 -std=c++17 -static-libstdc++ \
         bench/bench_append.cpp -o bench_arm && adb push bench_arm /data/local/tmp/ && \
         adb shell /data/local/tmp/bench_arm
+
+(On macOS the prebuilt directory is `darwin-x86_64`.)
 
 ## Update 2 — over Ethernet: where the *remaining* gap went
 

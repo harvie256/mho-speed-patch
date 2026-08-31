@@ -32,7 +32,9 @@ to `127.0.0.1:5555`, so the network is loopback (a memory copy) and what you
 measure is the pure on-device production rate. Cross-compile with the NDK and push:
 
 ```
-$NDK/.../aarch64-linux-android30-clang -O2 -o loopbench bench/loopbench.c
+export ANDROID_NDK=/path/to/android-ndk-r27c
+NDK=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin   # darwin-x86_64 on macOS
+$NDK/aarch64-linux-android30-clang -O2 -o loopbench bench/loopbench.c
 adb push loopbench /data/local/tmp/ && adb shell "su -c 'chmod 755 /data/local/tmp/loopbench'"
 adb shell "su -c '/data/local/tmp/loopbench 1000000 WORD 1000000 6'"   # depth fmt chunk reps
 ```
